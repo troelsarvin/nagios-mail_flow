@@ -1,0 +1,314 @@
+#!/usr/bin/env python
+
+# Mail Flow Checker version 2.0.
+
+#Copyright (C) 2013 by National Board of eHealth, Denmark, and Troels Arvin.
+#
+#Permission is hereby granted, free of charge, to any person obtaining a copy
+#of this software and associated documentation files (the "Software"), to deal
+#in the Software without restriction, including without limitation the rights
+#to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+#copies of the Software, and to permit persons to whom the Software is
+#furnished to do so, subject to the following conditions:
+#
+#The above copyright notice and this permission notice shall be included in
+#all copies or substantial portions of the Software.
+#
+#THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+#IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+#FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+#AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+#LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+#OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+#THE SOFTWARE.
+
+import psycopg2
+from imaplib import *
+import email.Utils
+import datetime
+import sys
+import syslog
+import os
+import getopt
+import socket
+from ConfigParser import SafeConfigParser
+
+# ====================
+# === PREPARATIONS ===
+# ====================
+
+# preparing to parse config file
+default_config_path_basename = 'mail_flow.cfg'
+default_config_path = '/etc/' + default_config_path_basename
+alt_config_path = os.path.dirname(__file__)+'/'+default_config_path_basename
+config_file = None
+# the above paths may be overridden by the -C argument
+
+# don't let database or SMTP connection attempts run for more than 10 seconds:
+connect_timeout = 10
+
+do_debug = False
+
+this_script = os.path.basename(__file__)
+
+# --------------- Helper functions ---------------
+def usage(exit_error=True):
+    print """Usage: %s [-C <config file>|--config_file=<config_file>] [-d|--debug] [-h|--help]
+
+config_file:  Complete path to optional config file. If no configuration file
+              is indicated, the system will look for the configuration at
+              the following paths (first path preferred):
+               - %s
+               - %s""" % (this_script,default_config_path,alt_config_path)
+    if exit_error:
+        sys.exit(1)
+
+def format_msg(msg):
+    with_config = ''
+    if config_file is not None:
+        with_config = " with config file '%s'" % config_file
+    return "When running script '%s'%s: %s" % (this_script,with_config,msg)
+
+def complain(msg):
+    sys.stderr.write(format_msg(msg))
+
+def log(msg):
+    syslog.syslog(format_msg(msg))
+
+def err(msg):
+    complain('Error: '+msg)
+    log('Error: '+msg)
+    sys.exit(1)
+
+def debug(msg):
+    if do_debug:
+        print "Debug: "+msg
+
+# Return datetime of when the mail was received at the last mail-server,
+# according to the top Received mail-header.
+# Returned value is in the local time of where the script is executed.
+def pull_timestamp_from_received_value(received_value):
+    last_semicolon_pos = received_value.rfind(';')
+    after_last_semicolon = received_value[last_semicolon_pos+1:].strip()
+    debug("after_last_semicolon: " + after_last_semicolon)
+    received_at = datetime.datetime.fromtimestamp(
+        email.Utils.mktime_tz(
+            email.Utils.parsedate_tz(after_last_semicolon)
+        )
+    )
+    return received_at
+
+# --------------- Parse args ---------------
+try:
+    options, args = getopt.getopt(sys.argv[1:],
+        'hdC:',
+        [ 'help', 'debug', 'config_file=' ]
+    )
+except getopt.GetoptError:
+    usage()
+
+for name, value in options:
+    if name in ("-h", "--help"):
+        usage(False)
+        sys.exit(0)
+    elif name in ("-d", "--debug"):
+        do_debug = True
+    else:
+        config_file = value
+
+if config_file is None:
+    if os.path.exists(default_config_path):
+        config_file = default_config_path
+    else:
+        config_file = alt_config_path
+
+if not os.path.exists(config_file):
+    err("No configuration file '%s'" % config_file)
+
+# --------------- Setup configuration ---------------
+defaults = {
+    'subject':                 'Mail flow test',
+    'imap_user':               'nagios',
+    'imap_use_ssl':            'yes',
+    'name':                    'nagios',
+    'schema':                  'mail_flow',
+    'message_table':           'messages',
+    'receive_execution_table': 'receive_script_execution'
+}
+
+config = SafeConfigParser(defaults)
+config.read(config_file)
+try:
+    mail_lookfor_subject =       config.get('mail','subject')
+    mail_smtp_server =           config.get('mail','smtp_server')
+    mail_from_addr =             config.get('mail','from_addr')
+    mail_to_addr =               config.get('mail','to_addr')
+    mail_imap_server =           config.get('mail','imap_server')
+    mail_imap_user=              config.get('mail','imap_user')
+    mail_imap_password=          config.get('mail','imap_password')
+    mail_imap_use_ssl=           config.get('mail','imap_use_ssl')
+    db_name =                    config.get('db','name')
+    db_schema =                  config.get('db','schema')
+    db_message_table =           config.get('db','message_table')
+    db_receive_execution_table = config.get('db','receive_execution_table')
+except Exception, e:
+    err("Configuration error: %s" % e)
+
+# --------------- Prepare DB ---------------
+try:
+    os.environ['PGCONNECT_TIMEOUT'] = str(connect_timeout)
+    db_conn = psycopg2.connect("dbname='%s'" % db_name);
+    cursor = db_conn.cursor()
+except psycopg2.DatabaseError, e:
+    # Lets not make DB connection errors generate cron error mails:
+    log(
+        "Could not connect to DB '%s', or could not open cursor, error message: '%s'" %
+        (db_name,str(e))
+    )
+    sys.exit(0)
+
+# --------------- Prepare IMAP connection ---------------
+try:
+    if mail_imap_use_ssl.lower()=='yes':
+        imap_con = IMAP4_SSL(mail_imap_server)
+    else:
+        imap_con = IMAP4(mail_imap_server)
+
+    imap_con.login(mail_imap_user,mail_imap_password)
+except (IMAP4.error,socket.timeout,socket.error), e:
+    # Lets not make IMAP connection errors generate cron error mails:
+    log(
+        "Could not connect to IMAP server '%s', or could not log in as user '%s'. Errmsg: '%s'" %
+        (mail_imap_server,mail_imap_user,str(e))
+    )
+    sys.exit(0)
+
+# Update the mail_flow.receive_script_execution table, so that we know that 
+# this script was run. This is to let the Nagios check return UNKNOWN, if
+# this script is not executed as expected.
+# Performed as a DELETE, and then INSERT, instead of an UPDATE, as there
+# may not be a row to update (most likely if this is the first time this
+# script is run).
+sql = """
+    DELETE FROM %s.%s
+    WHERE       smtp_server=%%(mail_smtp_server)s
+      AND       to_addr=%%(mail_to_addr)s
+      AND       subj=%%(mail_lookfor_subject)s
+""" % (db_schema,db_receive_execution_table)
+debug("  sql: '%s'" % sql)
+cursor.execute(
+    sql,{
+        'mail_smtp_server':     mail_smtp_server,
+        'mail_to_addr':         mail_to_addr,
+        'mail_lookfor_subject': mail_lookfor_subject
+    }
+)
+sql = """
+    INSERT INTO %s.%s (smtp_server,to_addr,subj)
+    VALUES      (%%(mail_smtp_server)s,%%(mail_to_addr)s,%%(mail_lookfor_subject)s)
+""" % (db_schema,db_receive_execution_table)
+debug("  sql: '%s'" % sql)
+cursor.execute(
+    sql,{
+        'mail_smtp_server':     mail_smtp_server,
+        'mail_to_addr':         mail_to_addr,
+        'mail_lookfor_subject': mail_lookfor_subject
+    }
+)
+db_conn.commit()
+
+
+# ===================
+# === GET TO WORK ===
+# ===================
+
+# --------------- Look at each message in inbox and see if it's relevant ---------------
+# For each message, update the database such that the corresponding
+# row gets a relevant received value.
+try:
+    num_messages = int(imap_con.select()[1][0])
+    debug("num_messages: %d" % num_messages)
+except Exception, e:
+    log("Could not perform 'select' on imap connection; error: '%s'" % e)
+    sys.exit(0)
+
+num_received = 0
+if num_messages > 0:
+    msgnums = imap_con.search(None, 'ALL')[1][0].split(' ')
+
+    for msgnum in msgnums:
+        debug("msgnum: %s" % msgnum)
+        try:
+            rfc822_message = imap_con.fetch(msgnum,'RFC822')[1][0][1]
+        except:
+            debug("  didn't fetch message with msgnum %s" % msgnum)
+            continue
+
+        try:
+            msg = email.message_from_string(rfc822_message)
+            msg_from     = msg['From']
+            msg_subj     = msg['Subject']
+            msg_id       = msg['Message-Id']
+            msg_received = msg['Received']
+            debug("  msg_id: %s" % msg_id)
+        except Exception, e:
+            log("Exception '%s' in mail parsing section; came from this: %s" % (e,msg))
+            continue
+
+        if msg_received is None:
+            log("Got None as received-header; came from this: %s" % msg)
+            continue
+
+        first_received_header_ts = pull_timestamp_from_received_value(msg_received)
+        debug("first_received_header_ts: " + str(first_received_header_ts))
+
+        # Some SMTP servers may modify the from-address; so let's concentrate 
+        # on the contents of <...>, if any <>-signs are present
+        if msg_from.find('<') != -1:
+            pos_of_last_lt = msg_from.rfind('<')
+            pos_of_first_gt = msg_from.find('>')
+            if pos_of_first_gt < 2:
+                # strange address; giving up on it
+                debug("  giving up on strange from address '%s'" % msg_from)
+                continue
+            addr_len =  pos_of_first_gt - pos_of_last_lt - 1
+            if addr_len < 3:
+                debug("  giving up on address '%s' which is only %d chars long" % (msg_from,addr_len))
+                continue
+            msg_from = msg_from[pos_of_last_lt+1:pos_of_first_gt]
+            debug("  parsed msg_from '%s'" % msg_from)
+
+        # Message systems may manipulate subject, so the subject string check is not as strict
+        # as one might expect:
+        if msg_from == mail_from_addr and msg_subj in mail_lookfor_subject:
+            # Now, I'm sure that the message is for me, so delete it, and update DB
+            imap_con.store(msgnum, '+FLAGS', r'\Deleted')
+            sql = """
+                UPDATE %s.%s
+                SET    received=CURRENT_TIMESTAMP,
+                       first_received_header_ts=%%(first_received_header_ts)s
+                WHERE  msg_id=%%(msg_id)s""" % (db_schema,db_message_table)
+            debug("  sql: '%s'" % sql)
+            cursor.execute(sql,{'first_received_header_ts':first_received_header_ts, 'msg_id':msg_id})
+            num_received += 1
+        else:
+            debug(
+                "  skipping; msg_from=%s<>mail_from_addr=%s or msg_subj='%s' is not a substring of mail_lookfor_subject='%s'" % 
+                (msg_from,mail_from_addr,msg_subj,mail_lookfor_subject)
+            ) 
+if num_received > 0:
+    db_conn.commit()
+
+# ================================
+# === HOUSEKEEPING AND CLEANUP ===
+# ================================
+try:
+    imap_con.expunge()
+    imap_con.close()
+    imap_con.logout()
+except Exception, e:
+    log("Exception '%s' in IMAP cleanup/logout section" % e)
+
+db_conn.close()
+
+sys.exit(0)

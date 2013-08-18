@@ -1,0 +1,408 @@
+#!/usr/bin/env python
+
+# Mail Flow Checker version 2.0.
+
+#Copyright (C) 2013 by National Board of eHealth, Denmark, and Troels Arvin.
+#
+#Permission is hereby granted, free of charge, to any person obtaining a copy
+#of this software and associated documentation files (the "Software"), to deal
+#in the Software without restriction, including without limitation the rights
+#to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+#copies of the Software, and to permit persons to whom the Software is
+#furnished to do so, subject to the following conditions:
+#
+#The above copyright notice and this permission notice shall be included in
+#all copies or substantial portions of the Software.
+#
+#THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+#IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+#FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+#AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+#LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+#OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+#THE SOFTWARE.
+
+# wrapping in gigantic try-block to be able to return 3 if something
+# unexpected goes wrong
+try:
+    import os
+    import sys
+    import getopt
+    from ConfigParser import SafeConfigParser
+    import psycopg2
+
+    # policy
+    default_warning_minutes = 30
+    default_critical_minutes = 300
+    default_unknown_minutes = 60
+    default_giveup_minutes = 0
+
+    # preparing to parse config file
+    default_config_path_basename = 'mail_flow.cfg'
+    default_config_path = '/etc/' + default_config_path_basename
+    alt_config_path = os.path.dirname(__file__)+'/'+default_config_path_basename
+    config_file = None
+    # the above paths may be overridden by the -C argument
+
+    # don't let database connection attempts run for more than 10 seconds:
+    connect_timeout = 10
+
+    # default db settings
+    default_mail_smtp_server = None
+    default_to_addr = 'nagios'
+    default_subj = 'Mail flow test'
+    default_db_name = 'nagios'
+    default_db_schema = 'mail_flow'
+    default_db_message_table = 'messages'
+    default_db_receive_execution_table = 'receive_script_execution'
+
+    this_script = os.path.basename(__file__) 
+    default_critical_hours = int(default_critical_minutes/60)
+    default_giveup_hours = int(default_giveup_minutes/60)
+    default_unknown_hours = int(default_unknown_minutes/60)
+
+    def usage():
+        print """Usage: %s [-h|--help] [-w|--warning <minutes>] [-c|--critical <minutes>] 
+                  [-g|--giveupafter <minutes>] [ -u|--unknownafter <minutes> ] 
+                  [-C|--config_file <cfg_file>]
+
+    warning minutes:      Number of minutes that a mail may be missing before
+                          yielding a warning status; default: %d
+
+    critical minutes:     Number of minutes that a mail may be missing before
+                          yielding a critical status; default: %d (%d hours)
+
+    giveupafter minutes:  Number of minutes after which to give up. 0 = forever.
+                          Default: %d (%d hours).
+
+    unknownafter minutes: Return UNKNOWN, if there has not been a sent probe mail
+                          for this amount of minutes, or if message-receiving has
+                          not happened for this amount of minutes. This could happen,
+                          if the related cron jobs are not running, or if they 
+                          keep failing. The implication os this is that the cron-job
+                          which runs the mail_flow_sender script should run more
+                          often than this value.
+                          Default: %d (%d hours).
+
+    cfg_file:             Where to read database configuration information from;
+                          Defaults to %s (preferred) or %s. If no configuration file
+                          is indicated, and no configuration file exists at default
+                          paths, the following database defaults are used:
+                          name=%s; schema=%s; message_table=%s
+
+    Note: The following must hold:
+        warning < critical < giveupafter""" % (
+                            this_script,
+                            default_warning_minutes,
+                            default_critical_minutes, default_critical_hours,
+                            default_giveup_minutes, default_giveup_hours,
+                            default_unknown_minutes, default_unknown_hours,
+                            default_config_path, alt_config_path,
+                            default_db_name,default_db_schema,default_db_message_table
+                        )
+        sys.exit(3)
+
+    try:
+        options, args = getopt.getopt \
+        (
+            sys.argv[1:],
+            "h:w:c:g:u:C:",
+            [
+                "help",
+                "warning=",
+                "critical=",
+                "giveupafter=",
+                "unknownafter=",
+                "config_file="
+            ]
+        )
+    except getopt.GetoptError:
+        usage()
+        sys.exit(3)
+
+    warning_minutes = default_warning_minutes
+    critical_minutes = default_critical_minutes
+    giveup_minutes = default_giveup_minutes
+    unknown_minutes = default_unknown_minutes
+
+    for name, value in options:
+        if name in ("-h", "--help"):
+            usage()
+        if name in ("-w", "--warning"):
+            try:
+                warning_minutes = int(value)
+            except Exception:
+                print "ERROR: Unable to convert warning_minutes to integer.\n"
+                print
+                usage()
+        if name in ("-c", "--critical"):
+            try:
+                critical_minutes = int(value)
+            except Exception:
+                print "ERROR: Unable to convert critical_minutes to integer.\n"
+                print
+                usage()
+        if name in ("-g", "--giveupafter"):
+            try:
+                giveup_minutes = int(value)
+            except Exception:
+                print "ERROR: Unable to convert giveup_minutes to integer.\n"
+                print
+                usage()
+        if name in ("-u", "--unknownafter"):
+            try:
+                unknown_minutes = int(value)
+            except Exception:
+                print "ERROR: Unable to convert unknown_minutes to integer.\n"
+                print
+                usage()
+        if name in ("-C", "--config_file"):
+            config_file = value
+            if not os.path.exists(config_file):
+                print "ERROR: No such file '%s'." % config_file
+                print
+                usage()
+
+    if config_file is None:
+        if os.path.exists(default_config_path):
+            config_file = default_config_path
+        else:
+            if os.path.exists(alt_config_path):
+                config_file = alt_config_path
+
+    if not (warning_minutes < critical_minutes):
+        print "ERROR: The 'warning < critical' precondition is violated."
+        print
+        usage()
+    if giveup_minutes != 0 and not (critical_minutes < giveup_minutes):
+        print "ERROR: The 'critical < giveup' precondition is violated."
+        print
+        usage()
+
+    if config_file is None:
+        mail_smtp_server           = default_mail_smtp_server
+        to_addr                    = default_to_addr
+        subj                       = default_subj
+        db_name                    = default_db_name
+        db_schema                  = default_db_schema
+        db_message_table           = default_db_message_table
+        db_receive_execution_table = default_db_receive_execution_table
+    else:
+        config = SafeConfigParser(
+            {
+                'smtp_server':             default_mail_smtp_server,
+                'subject':                 default_subj,
+                'name':                    default_db_name,
+                'schema':                  default_db_schema,
+                'message_table':           default_db_message_table,
+                'receive_execution_table': default_db_receive_execution_table
+            }
+        )
+        config.read(config_file)
+        mail_smtp_server           = config.get('mail','smtp_server')
+        to_addr                    = config.get('mail','to_addr')
+        subj                       = config.get('mail','subject')
+        db_name                    = config.get('db','name')
+        db_schema                  = config.get('db','schema')
+        db_message_table           = config.get('db','message_table')
+        db_receive_execution_table = config.get('db','receive_execution_table')
+
+    try:
+        # prepare db
+        os.environ['PGCONNECT_TIMEOUT'] = str(connect_timeout)
+        conn = psycopg2.connect("dbname='%s'" % db_name);
+        cursor = conn.cursor()
+
+        inject_sql_smtp_and_subj = ''
+        if mail_smtp_server is not None:
+            inject_sql_smtp_and_subj = " AND smtp_server = '%s' AND subj = %%(subj)s " % \
+                (mail_smtp_server)
+
+        inject_sql_giveup = ''
+        if giveup_minutes != 0:
+            inject_sql_giveup = " AND sent + INTERVAL '%d minutes' > CURRENT_TIMESTAMP " % \
+                giveup_minutes
+
+        # query and pull out result
+        sql = """
+            SELECT * FROM
+            (
+                SELECT COUNT(*) AS num_intransit
+                FROM %s.%s
+                WHERE received IS NULL
+                  AND to_addr='%s'
+                    %s
+                    %s
+            ) AS num_intransit,
+            (
+                SELECT COUNT(*) AS warncount
+                FROM %s.%s
+                WHERE received IS NULL
+                  AND to_addr='%s'
+                    %s
+                    %s
+                    AND sent + INTERVAL '%d minutes' < CURRENT_TIMESTAMP
+            ) AS warncount,
+            (
+                SELECT COUNT(*) AS critcount
+                FROM %s.%s
+                WHERE received IS NULL
+                  AND to_addr='%s'
+                    %s
+                    %s
+                    AND sent + INTERVAL '%d minutes' < CURRENT_TIMESTAMP
+            ) AS critcount,
+            (
+                SELECT CURRENT_TIMESTAMP-max(sent) AS interval_since_last_send
+                FROM %s.%s
+                WHERE to_addr='%s'
+                    %s
+            ) AS interval_since_last_send
+        """ % (
+            db_schema,db_message_table,to_addr,inject_sql_smtp_and_subj,inject_sql_giveup,
+            db_schema,db_message_table,to_addr,inject_sql_smtp_and_subj,inject_sql_giveup,warning_minutes,
+            db_schema,db_message_table,to_addr,inject_sql_smtp_and_subj,inject_sql_giveup,critical_minutes,
+            db_schema,db_message_table,to_addr,inject_sql_smtp_and_subj
+        )
+        cursor.execute(sql,{'subj':subj,'subj':subj,'subj':subj,'subj':subj})
+        msg_row = cursor.fetchone()
+        if msg_row:
+            num_intransit,num_warn,num_crit,interval_since_last_send = msg_row
+
+            interval_since_last_send_minutes = None
+            if interval_since_last_send:
+                interval_since_last_send_minutes = (
+                    interval_since_last_send.days*(24*60*60) +
+                    interval_since_last_send.seconds/60
+                )
+
+            lookfor_age = None
+            output_num = None
+            if num_warn > 0:
+                lookfor_age = warning_minutes
+                output_num = num_warn
+            if num_crit > 0:
+                lookfor_age = critical_minutes
+                output_num = num_crit
+
+            # obtain an example of a message id which is missing
+            if lookfor_age is not None:
+                sql = """
+                    SELECT   msg_id,sent
+                    FROM     %s.%s
+                    WHERE    sent = (
+                        SELECT MIN(sent)
+                        FROM   %s.%s
+                        WHERE  received IS NULL
+                          AND  to_addr='%s' %s %s
+                    )
+                      AND    to_addr='%s' %s %s
+                    ORDER BY msg_id
+                    LIMIT 1
+                """ % (
+                    db_schema,
+                    db_message_table,
+                    db_schema,
+                    db_message_table,
+                    to_addr,
+                    inject_sql_smtp_and_subj,
+                    inject_sql_giveup,
+                    to_addr,
+                    inject_sql_smtp_and_subj,
+                    inject_sql_giveup
+                )
+                cursor.execute(sql,{'subj':subj,'subj':subj})
+                msg_id,sent = cursor.fetchone()
+
+            # Let's determine the delay, as calculated by the receive-script (if the
+            # receive script has been executed, at all)
+            sql = """
+                SELECT * FROM
+                (
+                    SELECT first_received_header_ts - sent AS delay
+                    FROM %s.%s
+                    WHERE first_received_header_ts IS NOT NULL
+                      AND to_addr='%s'
+                        %s
+                    ORDER BY sent DESC FETCH FIRST 1 ROWS ONLY
+                ) AS delay,
+                (
+                    SELECT CURRENT_TIMESTAMP-ts AS interval_since_last_receive_execution
+                    FROM %s.%s
+                    WHERE to_addr='%s'
+                        %s
+                ) AS interval_since_last_receive_execution
+            """ % (
+                db_schema,db_message_table,to_addr,inject_sql_smtp_and_subj,
+                db_schema,db_receive_execution_table,to_addr,inject_sql_smtp_and_subj
+            )
+            cursor.execute(sql,{'subj':subj,'subj':subj})
+            receive_row = cursor.fetchone()
+            interval_since_last_receive_execution_minutes = None
+            delay_seconds = None
+            if receive_row:
+                delay,interval_since_last_receive_execution = receive_row
+                if delay:
+                    delay_seconds = (
+                        delay.days*(24*60*60) + 
+                        delay.seconds + delay.microseconds/1000000.0
+                    )
+                interval_since_last_receive_execution_minutes = (
+                    interval_since_last_receive_execution.days*(24*60*60) +
+                    interval_since_last_receive_execution.seconds/60
+                )
+
+        cursor.close()
+
+    except StandardError, msg:
+        print("Error working with the message database")
+        sys.stderr.write('Database error: %s' % msg)
+        sys.exit(3)
+
+    # return with relevant exit code and message
+
+    if interval_since_last_send_minutes is None:
+        print "MAILFLOW UNKNOWN: No probe mail has successfully been sent yet"
+        sys.exit(3)
+
+    if interval_since_last_send_minutes > unknown_minutes:
+        print "MAILFLOW UNKNOWN: No probe mail has successfully been sent for %d minutes" % \
+            interval_since_last_send_minutes
+        sys.exit(3)
+
+    if interval_since_last_receive_execution_minutes is None:
+        print "MAILFLOW UNKNOWN: The receive script has never been successfully run after a probe mail"
+        sys.exit(3)
+
+    if interval_since_last_receive_execution_minutes > unknown_minutes:
+        print "MAILFLOW UNKNOWN: The receive script has not been successfully run for %d minutes" % \
+            interval_since_last_receive_execution_minutes
+        sys.exit(3)
+
+    # Prepare performance data
+    perf_intrans = 'num_in_transit=%d' % num_intransit
+    perf_delay = ''
+    if delay_seconds is not None:
+        perf_delay = ' delay_of_last_delivery=%.3fs' % delay_seconds
+    perf_str = '%s%s' % (perf_intrans, perf_delay)
+
+    if num_crit==0 and num_warn==0:
+        print "MAILFLOW OK: Mails in transit: %d; none older than %d minutes|%s" % (num_intransit,warning_minutes,perf_str)
+        sys.exit(0)
+    else:
+        output_trailer = \
+            "%d in-transit mail(s) older than %d minutes; msg_id of oldest missing message: '%s', sent to '%s' at time %s|%s" % \
+            (output_num,lookfor_age,msg_id,to_addr,sent,perf_str)
+        if num_crit != 0:
+            print "MAILFLOW CRITICAL: %s" % output_trailer
+            sys.exit(2)
+        if num_warn != 0:
+            print "MAILFLOW WARNING: %s" % output_trailer
+            sys.exit(1)
+
+except SystemExit, e:
+    sys.exit(int(str(e)))
+except:
+    print "MAILFLOW UNKNOWN: An unhandled error occurred"
+    sys.stderr.write('Unhandled error: %s' % sys.exc_info()[1])
+    sys.exit(3)
